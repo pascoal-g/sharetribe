@@ -28,6 +28,10 @@ class TransactionProcessStateMachine
   transition from: :paid,                           to: [:confirmed, :canceled, :disputed]
   transition from: :disputed,                       to: [:refunded, :dismissed]
 
+  after_transition do |transaction, transition|
+    transaction.update_column(:current_state, transition.to_state) # rubocop:disable Rails/SkipsModelValidations
+  end
+
   after_transition(to: :paid, after_commit: true) do |transaction|
     payer = transaction.starter
     current_community = transaction.community
@@ -76,8 +80,20 @@ class TransactionProcessStateMachine
     send_new_transaction_email(transaction) if transaction.conversation.payment?
   end
 
+  # "guard_transition" is before SQL BEGIN-COMMIT block
+  # instead, "before_transition" is inside the block
+  before_transition(to: :preauthorized) do |transaction|
+    Listing.lock.find(transaction.listing_id)
+    raise ActiveRecord::Rollback unless transaction.booking.valid?
+  end
+
+  after_transition_failure(to: :preauthorized) do |transaction|
+    void_payment(transaction)
+  end
+
   after_transition(to: :preauthorized, after_commit: true) do |transaction|
     send_new_transaction_email(transaction)
+    handle_preauthorized(transaction)
   end
 
   after_transition(to: :refunded, after_commit: true) do |transaction|
@@ -106,6 +122,57 @@ class TransactionProcessStateMachine
 
     def reject_transaction(transaction)
       transaction.update_column(:deleted, true) # rubocop:disable Rails/SkipsModelValidations
+    end
+
+    def handle_preauthorized(transaction)
+      expiration_period = TransactionService::Transaction.authorization_expiration_period(transaction.payment_gateway)
+      gateway_expires_at = case transaction.payment_gateway
+                           when :paypal
+                             # expiration period in PayPal is an estimate,
+                             # which should be quite accurate. We can get
+                             # the exact time from Paypal through IPN notification. In this case,
+                             # we take the 3 days estimate and add 10 minute buffer
+                             expiration_period.days.from_now - 10.minutes
+                           when :stripe
+                             expiration_period.days.from_now - 10.minutes
+                           else
+                             raise ArgumentError.new("Unknown payment_type: '#{transaction.payment_gateway}'")
+                           end
+
+      booking_ends_on = transaction.booking&.final_end
+      expire_at = TransactionService::Transaction.preauth_expires_at(gateway_expires_at, booking_ends_on)
+
+      Delayed::Job.enqueue(TransactionPreauthorizedJob.new(transaction.id), priority: 5)
+      Delayed::Job.enqueue(AutomaticallyRejectPreauthorizedTransactionJob.new(transaction.id), priority: 8, run_at: expire_at)
+
+      setup_preauthorize_reminder(transaction.id, expire_at)
+    end
+
+    def setup_preauthorize_reminder(transaction_id, expire_at)
+      reminder_days_before = 1
+
+      reminder_at = expire_at - reminder_days_before.day
+      send_reminder = reminder_at > Time.zone.now
+
+      if send_reminder
+        Delayed::Job.enqueue(TransactionPreauthorizedReminderJob.new(transaction_id), priority: 9, :run_at => reminder_at)
+      end
+    end
+
+    def void_payment(tx)
+      gateway_adapter = TransactionService::Transaction.gateway_adapter(tx.payment_gateway)
+      void_res = gateway_adapter.reject_payment(tx: tx, reason: "")[:response]
+
+      void_res.on_success {
+        logger.info("Payment voided after failed transaction", :void_payment, tx.slice(:community_id, :id))
+      }.on_error { |payment_error_msg, payment_data|
+        logger.error("Failed to void payment after failed booking", :failed_void_payment, tx.slice(:community_id, :id).merge(error_msg: payment_error_msg))
+      }
+      void_res
+    end
+
+    def logger
+      SharetribeLogger.new(:transaction_transition_events)
     end
   end
 end
